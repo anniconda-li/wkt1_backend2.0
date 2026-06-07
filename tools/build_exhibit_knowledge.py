@@ -1,3 +1,19 @@
+"""展品知识库构建工具。
+
+从展品参考图片和候选配置文件出发，通过视觉模型生成每件展品的：
+1. 详细视觉检索描述（detailed_visual_description）
+2. 视觉检索关键词（visual_keywords）
+3. 名称约束规则（name_constraints）
+
+并将结果导出为 Markdown 知识文档，供百炼知识库应用使用。
+
+工作流程：
+1. 加载 museum_vision_candidates.json 候选配置
+2. 对每个候选展品，使用参考图片调用视觉模型生成视觉检索索引
+3. 将结果保存到 museum_vision_index.json
+4. 导出每个展品为独立的 .md 知识文档
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -11,34 +27,43 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# 将项目根目录加入 Python 路径
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import core.config  # noqa: E402,F401 - loads project .env
+import core.config  # noqa: E402,F401 - 加载项目 .env 环境变量
 from core.paths import CONFIG_DIR, EXHIBITS_KNOWLEDGE_DIR, ensure_project_dirs
 
-
+# 配置文件路径
 CANDIDATES_PATH = CONFIG_DIR / "museum_vision_candidates.json"
 VISION_INDEX_PATH = CONFIG_DIR / "museum_vision_index.json"
 LOG_PREFIX = "[BUILD-EXHIBIT-KNOWLEDGE]"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build per-exhibit Markdown knowledge docs from reference images.")
-    parser.add_argument("--id", dest="candidate_id", default="", help="only process one exhibit id")
-    parser.add_argument("--limit", type=int, default=0, help="max exhibits to process")
-    parser.add_argument("--overwrite", action="store_true", help="regenerate existing vision index entries")
-    parser.add_argument("--dry-run", action="store_true", help="check config and images without writing files")
-    parser.add_argument("--export-only", action="store_true", help="export Markdown from existing vision index only")
+    """主函数：构建展品知识库。
+
+    Returns:
+        int: 0 成功，1 有视觉识别失败
+    """
+    parser = argparse.ArgumentParser(description="从参考图片生成展品知识库 Markdown 文档")
+    parser.add_argument("--id", dest="candidate_id", default="", help="仅处理指定展品 ID")
+    parser.add_argument("--limit", type=int, default=0, help="最多处理的展品数量")
+    parser.add_argument("--overwrite", action="store_true", help="覆盖已有的视觉索引条目")
+    parser.add_argument("--dry-run", action="store_true", help="仅检查配置和图片，不写文件")
+    parser.add_argument("--export-only", action="store_true", help="仅从已有视觉索引导出 Markdown")
     args = parser.parse_args()
 
     ensure_project_dirs()
     EXHIBITS_KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 加载候选展品和已有索引
     candidates = _select_candidates(_load_candidates(CANDIDATES_PATH), args.candidate_id, args.limit)
     index_by_id = _load_index(VISION_INDEX_PATH)
-    _log(f"loaded candidates count={len(candidates)}")
+    _log(f"已加载候选展品 count={len(candidates)}")
 
+    # 统计信息
     summary = {
         "total_candidates": len(candidates),
         "processed": 0,
@@ -54,44 +79,49 @@ def main() -> int:
         _print_summary(summary)
         return 0
 
+    # 逐展品处理
     for candidate in candidates:
         candidate_id = _candidate_id(candidate)
         standard_name = _standard_name(candidate)
         summary["processed"] += 1
-        _log(f"processing id={candidate_id} name={standard_name}")
+        _log(f"处理 id={candidate_id} name={standard_name}")
 
         image_path = _first_existing_reference_image(candidate)
         if image_path is None:
             summary["missing_images"] += 1
             for ref in _reference_images(candidate) or [""]:
-                _log(f"image missing path={ref}")
+                _log(f"图片缺失 path={ref}")
             if candidate_id not in index_by_id:
                 index_by_id[candidate_id] = _entry_from_candidate(
                     candidate,
                     None,
                     parse_ok=False,
-                    error="missing reference image",
+                    error="缺少参考图片",
                 )
         else:
-            _log(f"image exists path={_project_relative(image_path)}")
+            _log(f"图片存在 path={_project_relative(image_path)}")
 
         existing = index_by_id.get(candidate_id)
+
         if args.export_only:
+            # 仅导出模式：不调用视觉模型
             if existing is None:
                 index_by_id[candidate_id] = _entry_from_candidate(
                     candidate,
                     image_path,
                     parse_ok=False,
-                    error="not indexed",
+                    error="未索引",
                 )
             summary["markdown_exported"] += _export_one(candidate, index_by_id[candidate_id])
             continue
 
         if image_path is not None and existing and existing.get("parse_ok") is True and not args.overwrite:
+            # 跳过已有成功索引的展品
             summary["skipped_existing"] += 1
-            _log(f"skip existing vision index id={candidate_id}")
+            _log(f"跳过已有视觉索引 id={candidate_id}")
         elif image_path is not None:
-            _log(f"vision start id={candidate_id}")
+            # 调用视觉模型生成索引
+            _log(f"视觉模型开始 id={candidate_id}")
             start = time.perf_counter()
             try:
                 vision_result = _call_vision_model(candidate, image_path)
@@ -104,7 +134,7 @@ def main() -> int:
                     result=vision_result,
                 )
                 summary["vision_success"] += 1
-                _log(f"vision done id={candidate_id} elapsed_ms={elapsed_ms} parse_ok=true")
+                _log(f"视觉模型完成 id={candidate_id} elapsed_ms={elapsed_ms} parse_ok=true")
             except Exception as exc:
                 elapsed_ms = int((time.perf_counter() - start) * 1000)
                 index_by_id[candidate_id] = _entry_from_candidate(
@@ -114,10 +144,12 @@ def main() -> int:
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 summary["vision_failed"] += 1
-                _log(f"vision done id={candidate_id} elapsed_ms={elapsed_ms} parse_ok=false")
+                _log(f"视觉模型完成 id={candidate_id} elapsed_ms={elapsed_ms} parse_ok=false")
 
+        # 保存视觉索引
         VISION_INDEX_PATH.write_text(json.dumps(index_by_id, ensure_ascii=False, indent=2), encoding="utf-8")
-        _log(f"index saved path={_project_relative(VISION_INDEX_PATH)}")
+        _log(f"索引已保存 path={_project_relative(VISION_INDEX_PATH)}")
+        # 导出 Markdown 知识文档
         summary["markdown_exported"] += _export_one(candidate, index_by_id[candidate_id])
 
     _print_summary(summary)
@@ -125,13 +157,20 @@ def main() -> int:
 
 
 def _load_candidates(path: Path) -> list[dict[str, Any]]:
+    """从 JSON 文件加载候选展品列表。"""
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
-        raise ValueError(f"candidates JSON must be a list: {path}")
+        raise ValueError(f"候选展品 JSON 必须是列表: {path}")
     return [item for item in data if isinstance(item, dict)]
 
 
 def _load_index(path: Path) -> dict[str, dict[str, Any]]:
+    """加载已有的视觉索引文件。
+
+    兼容两种格式：
+    - 新版：{"entries": [...]}
+    - 旧版：{"candidate_id": {...}}
+    """
     if not path.exists():
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -151,6 +190,7 @@ def _load_index(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def _normalize_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """规范化索引条目，统一字段名和填充默认值。"""
     candidate_id = str(entry.get("candidate_id") or entry.get("id") or "").strip()
     vision_result = entry.get("vision_result") if isinstance(entry.get("vision_result"), dict) else {}
     detailed = str(entry.get("detailed_visual_description") or "").strip()
@@ -174,6 +214,7 @@ def _normalize_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def _select_candidates(candidates: list[dict[str, Any]], candidate_id: str, limit: int) -> list[dict[str, Any]]:
+    """按 ID 或数量限制筛选候选展品。"""
     selected = candidates
     if candidate_id:
         selected = [candidate for candidate in selected if _candidate_id(candidate) == candidate_id]
@@ -183,29 +224,43 @@ def _select_candidates(candidates: list[dict[str, Any]], candidate_id: str, limi
 
 
 def _dry_run(candidates: list[dict[str, Any]], summary: dict[str, int]) -> None:
+    """预检查模式：验证配置和参考图片是否存在。"""
     for candidate in candidates:
         candidate_id = _candidate_id(candidate)
-        _log(f"processing id={candidate_id} name={_standard_name(candidate)}")
+        _log(f"处理 id={candidate_id} name={_standard_name(candidate)}")
         summary["processed"] += 1
         refs = _reference_images(candidate)
         if not refs:
             summary["missing_images"] += 1
-            _log("image missing path=")
+            _log("图片缺失 path=")
             continue
         for ref in refs:
             if _project_path(ref).exists():
-                _log(f"image exists path={ref}")
+                _log(f"图片存在 path={ref}")
             else:
                 summary["missing_images"] += 1
-                _log(f"image missing path={ref}")
+                _log(f"图片缺失 path={ref}")
 
 
 def _call_vision_model(candidate: dict[str, Any], image_path: Path) -> dict[str, Any]:
+    """调用视觉模型生成展品的视觉检索描述。
+
+    Args:
+        candidate: 候选展品配置字典
+        image_path: 参考图片路径
+
+    Returns:
+        dict: 视觉模型生成的检索描述结果
+
+    Raises:
+        RuntimeError: API Key 未配置或调用失败
+        ValueError: 不支持的 provider 或返回非 JSON
+    """
     provider = os.getenv("VISION_PROVIDER", "dashscope").strip().lower()
     if provider == "mock":
         return _mock_vision_result(candidate)
     if provider != "dashscope":
-        raise ValueError(f"unsupported VISION_PROVIDER: {provider}")
+        raise ValueError(f"不支持的 VISION_PROVIDER: {provider}")
 
     api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
     if not api_key:
@@ -214,6 +269,7 @@ def _call_vision_model(candidate: dict[str, Any], image_path: Path) -> dict[str,
     import dashscope
 
     dashscope.api_key = api_key
+    # 调用多模态视觉模型
     response = dashscope.MultiModalConversation.call(
         model=os.getenv("VISION_MODEL", "qwen-vl-plus").strip(),
         messages=[
@@ -241,10 +297,14 @@ def _call_vision_model(candidate: dict[str, Any], image_path: Path) -> dict[str,
 
 
 def _build_vision_prompt(candidate: dict[str, Any]) -> str:
+    """构建发送给视觉模型的展品检索描述生成 prompt。
+
+    强调只根据图片可见内容描述，不编造文物历史信息。
+    """
     standard_name = _standard_name(candidate)
     aliases = "、".join(_aliases(candidate)) or "无"
     category = str(candidate.get("category") or "").strip()
-    return f"""你是博物馆文物“视觉检索索引”生成助手。
+    return f"""你是博物馆文物"视觉检索索引"生成助手。
 
 你的任务不是写导游讲解，也不是判断文物历史信息，而是根据标准文物图片，生成一段适合后续图像检索和文本匹配的详细视觉描述。
 
@@ -282,6 +342,7 @@ def _build_vision_prompt(candidate: dict[str, Any]) -> str:
 
 
 def _coerce_vision_result(candidate: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    """规范化视觉模型返回的结果数据。"""
     detailed = str(data.get("detailed_visual_description") or data.get("visual_description") or "").strip()
     if not detailed:
         detailed = _join_old_visual_fields(data)
@@ -296,6 +357,7 @@ def _coerce_vision_result(candidate: dict[str, Any], data: dict[str, Any]) -> di
 
 
 def _mock_vision_result(candidate: dict[str, Any]) -> dict[str, Any]:
+    """生成 mock 视觉检索描述（用于开发测试）。"""
     standard_name = _standard_name(candidate)
     aliases = _aliases(candidate)
     category = str(candidate.get("category") or "").strip()
@@ -309,7 +371,7 @@ def _mock_vision_result(candidate: dict[str, Any]) -> dict[str, Any]:
         ),
         "visual_keywords": [item for item in [category, standard_name, *aliases] if item][:20],
         "name_constraints": [
-            f"具体展品名称只能使用标准名称“{standard_name}”或配置中的别名。",
+            f'具体展品名称只能使用标准名称"{standard_name}"或配置中的别名。',
             "不得根据视觉特征拼接新的展品名称。",
         ],
     }
@@ -323,6 +385,7 @@ def _entry_from_candidate(
     error: str,
     result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """从候选展品和视觉结果构建索引条目。"""
     result = result or {}
     standard_name = _standard_name(candidate)
     aliases = _aliases(candidate)
@@ -342,15 +405,25 @@ def _entry_from_candidate(
 
 
 def _export_one(candidate: dict[str, Any], entry: dict[str, Any]) -> int:
+    """导出一个展品的 Markdown 知识文档。
+
+    Returns:
+        int: 导出数量（1）
+    """
     candidate_id = _candidate_id(candidate)
     output_path = EXHIBITS_KNOWLEDGE_DIR / f"{candidate_id}.md"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(_build_markdown(candidate, entry), encoding="utf-8")
-    _log(f"markdown exported path={_project_relative(output_path)}")
+    _log(f"Markdown 已导出 path={_project_relative(output_path)}")
     return 1
 
 
 def _build_markdown(candidate: dict[str, Any], entry: dict[str, Any]) -> str:
+    """构建展品的完整 Markdown 知识文档。
+
+    包含：标准名称、别名、类别、视觉检索描述、检索关键词、
+    文物基础信息、导游讲解、名称约束、资料来源。
+    """
     candidate_id = _candidate_id(candidate)
     standard_name = _standard_name(candidate)
     aliases = _aliases(candidate)
@@ -365,45 +438,45 @@ def _build_markdown(candidate: dict[str, Any], entry: dict[str, Any]) -> str:
         guide_text = _fallback_guide_text(candidate, detailed)
 
     lines = [
-            f"# {standard_name}",
-            "",
-            f"文物ID：{candidate_id}  ",
-            f"标准名称：{standard_name}  ",
-            f"别名：{'、'.join(aliases) if aliases else '无'}  ",
-            f"类别：{category or '未知'}",
-            "",
-            "## 视觉检索描述",
-            "",
-            detailed,
-            "",
-            "## 视觉检索关键词",
-            "",
-            "、".join(keywords) if keywords else "暂无",
-            "",
-            "## 文物基础信息",
-            "",
-            f"年代：{_basic_value(basic_info, 'dynasty', '未知')}  ",
-            f"用途：{_basic_value(basic_info, 'usage', '未知')}  ",
-            f"材质：{_basic_value(basic_info, 'material', '未知')}  ",
-            f"馆藏：{_basic_value(basic_info, 'collection', '平顶山市博物馆')}  ",
-            f"出土信息：{_basic_value(basic_info, 'excavation', '暂无明确资料')}",
-            "",
-            "## 导游讲解",
-            "",
-            guide_text,
-            "",
-            "## 名称约束",
-            "",
-            "具体展品名称只能使用知识库中的标准名称或别名。",
-            "",
-            f"标准名称：{standard_name}  ",
-            f"允许别名：{'、'.join(aliases) if aliases else '无'}",
-            "",
-            "不得根据视觉描述、类别、形状、材质、年代、地区等信息自行拼接新的展品名称。",
-            "",
-            "\n".join(constraints) if constraints else "",
-            "",
-        ]
+        f"# {standard_name}",
+        "",
+        f"文物ID：{candidate_id}  ",
+        f"标准名称：{standard_name}  ",
+        f"别名：{'、'.join(aliases) if aliases else '无'}  ",
+        f"类别：{category or '未知'}",
+        "",
+        "## 视觉检索描述",
+        "",
+        detailed,
+        "",
+        "## 视觉检索关键词",
+        "",
+        "、".join(keywords) if keywords else "暂无",
+        "",
+        "## 文物基础信息",
+        "",
+        f"年代：{_basic_value(basic_info, 'dynasty', '未知')}  ",
+        f"用途：{_basic_value(basic_info, 'usage', '未知')}  ",
+        f"材质：{_basic_value(basic_info, 'material', '未知')}  ",
+        f"馆藏：{_basic_value(basic_info, 'collection', '平顶山市博物馆')}  ",
+        f"出土信息：{_basic_value(basic_info, 'excavation', '暂无明确资料')}",
+        "",
+        "## 导游讲解",
+        "",
+        guide_text,
+        "",
+        "## 名称约束",
+        "",
+        "具体展品名称只能使用知识库中的标准名称或别名。",
+        "",
+        f"标准名称：{standard_name}  ",
+        f"允许别名：{'、'.join(aliases) if aliases else '无'}",
+        "",
+        "不得根据视觉描述、类别、形状、材质、年代、地区等信息自行拼接新的展品名称。",
+        "",
+        "\n".join(constraints) if constraints else "",
+        "",
+    ]
     if source_urls:
         lines.extend(["## 资料来源", ""])
         lines.extend(f"- {url}" for url in source_urls)
@@ -412,6 +485,10 @@ def _build_markdown(candidate: dict[str, Any], entry: dict[str, Any]) -> str:
 
 
 def _fallback_guide_text(candidate: dict[str, Any], detailed_visual_description: str) -> str:
+    """生成本地降级导游讲解文本（不依赖 LLM）。
+
+    使用展品基本信息和视觉描述拼接一个简单的讲解文案。
+    """
     standard_name = _standard_name(candidate)
     category = str(candidate.get("category") or "文物").strip()
     basic_info = candidate.get("basic_info") if isinstance(candidate.get("basic_info"), dict) else {}
@@ -432,6 +509,7 @@ def _fallback_guide_text(candidate: dict[str, Any], detailed_visual_description:
 
 
 def _first_existing_reference_image(candidate: dict[str, Any]) -> Path | None:
+    """获取候选展品的第一张存在的参考图片路径。"""
     for ref in _reference_images(candidate):
         path = _project_path(ref)
         if path.exists():
@@ -440,6 +518,7 @@ def _first_existing_reference_image(candidate: dict[str, Any]) -> Path | None:
 
 
 def _reference_images(candidate: dict[str, Any]) -> list[str]:
+    """获取候选展品的参考图片路径列表。"""
     refs = candidate.get("reference_images")
     if not isinstance(refs, list):
         return []
@@ -447,29 +526,35 @@ def _reference_images(candidate: dict[str, Any]) -> list[str]:
 
 
 def _candidate_id(candidate: dict[str, Any]) -> str:
+    """获取候选展品 ID。"""
     return str(candidate.get("id") or "").strip()
 
 
 def _standard_name(candidate: dict[str, Any]) -> str:
+    """获取候选展品的标准名称。"""
     return str(candidate.get("standard_name") or candidate.get("name") or "").strip()
 
 
 def _aliases(candidate: dict[str, Any]) -> list[str]:
+    """获取候选展品的别名列表。"""
     return _str_list(candidate.get("aliases"))
 
 
 def _basic_value(basic_info: dict[str, Any], key: str, fallback: str) -> str:
+    """从文物基础信息字典中安全获取值。"""
     return str(basic_info.get(key) or "").strip() or fallback
 
 
 def _default_name_constraints(standard_name: str) -> list[str]:
+    """生成默认的名称约束规则。"""
     return [
-        f"具体展品名称只能使用标准名称“{standard_name}”或配置中的别名。",
+        f'具体展品名称只能使用标准名称"{standard_name}"或配置中的别名。',
         "不得根据视觉描述、类别、形状、材质、年代、地区等信息自行拼接新的展品名称。",
     ]
 
 
 def _project_path(value: str) -> Path:
+    """将字符串路径转为绝对路径（相对路径相对于项目根目录）。"""
     path = Path(value)
     if path.is_absolute():
         return path
@@ -477,6 +562,7 @@ def _project_path(value: str) -> Path:
 
 
 def _project_relative(path: Path) -> str:
+    """将绝对路径转为相对于项目根目录的路径字符串。"""
     try:
         return path.resolve().relative_to(PROJECT_ROOT).as_posix()
     except ValueError:
@@ -484,11 +570,13 @@ def _project_relative(path: Path) -> str:
 
 
 def _image_data_url(image_path: Path) -> str:
+    """将图片编码为 base64 data URL。"""
     encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
 
 
 def _response_to_dict(response: Any) -> dict[str, Any]:
+    """将 DashScope API 响应转为字典。"""
     if isinstance(response, dict):
         return response
     to_dict = getattr(response, "to_dict", None)
@@ -502,6 +590,7 @@ def _response_to_dict(response: Any) -> dict[str, Any]:
 
 
 def _extract_response_text(value: Any) -> str:
+    """递归提取 API 响应中的文本内容。"""
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, dict):
@@ -544,6 +633,7 @@ def _extract_response_text(value: Any) -> str:
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
+    """从文本中提取 JSON 对象（去除 Markdown 代码块标记后）。"""
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
@@ -562,6 +652,7 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
 
 def _join_old_visual_fields(value: dict[str, Any]) -> str:
+    """合并旧版视觉描述字段为单一字符串。"""
     parts = []
     for key in (
         "visual_description",
@@ -580,6 +671,7 @@ def _join_old_visual_fields(value: dict[str, Any]) -> str:
 
 
 def _str_list(value: Any) -> list[str]:
+    """将输入转为非空字符串列表。"""
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     if isinstance(value, str) and value.strip():
@@ -588,6 +680,7 @@ def _str_list(value: Any) -> list[str]:
 
 
 def _preview_text(text: str, limit: int) -> str:
+    """截取文本预览，特殊字符转义。"""
     normalized = (text or "").replace("\r", "\\r").replace("\n", "\\n")
     if len(normalized) <= limit:
         return normalized
@@ -595,14 +688,17 @@ def _preview_text(text: str, limit: int) -> str:
 
 
 def _utc_now() -> str:
+    """获取当前 UTC 时间的 ISO 格式字符串。"""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def _log(message: str) -> None:
+    """输出带前缀的日志。"""
     print(f"{LOG_PREFIX} {message}", flush=True)
 
 
 def _print_summary(summary: dict[str, int]) -> None:
+    """打印构建统计摘要。"""
     print("summary:")
     for key in (
         "total_candidates",

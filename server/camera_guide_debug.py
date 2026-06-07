@@ -1,3 +1,13 @@
+"""相机导游调试模块。
+
+提供端到端的相机导游测试功能：
+1. 调用视觉服务分析图片（VisionService）
+2. 将视觉结果重写为知识库检索 prompt
+3. 调用百炼应用生成导游讲解（BailianAppService）
+
+主要用于调试和验证"拍照→视觉识别→知识库导游"这条完整链路。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,12 +21,24 @@ from core.paths import DEFAULT_CAMERA_TEST_IMAGE
 from services.bailian_app_service import FALLBACK_TEXT, BailianAppService
 from services.vision_service import VisionJsonParseError, VisionService
 
-
+# 默认测试提问文本
 DEFAULT_CAMERA_GUIDE_TEST_TEXT = "这是什么"
 logger = logging.getLogger(__name__)
 
 
 def build_camera_guide_prompt(user_text: str, vision_result: dict[str, Any]) -> str:
+    """根据视觉分析结果和用户问题构建知识库检索 prompt。
+
+    将视觉模型的输出（类别、关键词、视觉描述）重组为
+    适合百炼知识库应用检索和回答的提示词。
+
+    Args:
+        user_text: 用户的问题（如"这是什么"）
+        vision_result: 视觉分析结果字典（来自 analyze_for_guide_context）
+
+    Returns:
+        str: 重写后的知识库检索 prompt
+    """
     visual_summary = str(vision_result.get("visual_summary") or "").strip() or "图片中展品信息不清。"
     keywords = "、".join(_str_list(vision_result.get("search_keywords"))) or "无明确关键词"
     category = str(vision_result.get("category") or "无法判断").strip() or "无法判断"
@@ -25,7 +47,7 @@ def build_camera_guide_prompt(user_text: str, vision_result: dict[str, Any]) -> 
         f"{visual_summary}\n\n"
         "检索关键词：\n"
         f"{keywords}\n\n"
-        f"用户问：“{user_text}”\n\n"
+        f'用户问："{user_text}"\n\n'
         "请根据知识库中同一文物条目的视觉检索描述、文物基础信息和导游讲解回答。\n"
         "具体展品名称必须使用知识库原文中的标准名称或别名，不得自造名称。\n"
         f"如果无法匹配到具体文物，请只说明它可能属于{category}类展品，不要编造具体名称。\n"
@@ -40,8 +62,27 @@ async def run_camera_guide_test(
     test_image_path: Path = DEFAULT_CAMERA_TEST_IMAGE,
     user_text: str = DEFAULT_CAMERA_GUIDE_TEST_TEXT,
 ) -> dict[str, Any]:
+    """运行一次完整的相机导游测试。
+
+    流程：
+    1. 检查测试图片是否存在
+    2. 视觉分析（analyze_for_guide_context）
+    3. 重写 prompt（build_camera_guide_prompt）
+    4. 调用百炼应用获取导游讲解
+    5. 返回包含所有中间结果和耗时统计的字典
+
+    Args:
+        vision_service: 视觉服务实例
+        bailian_app_service: 百炼应用服务实例
+        test_image_path: 测试图片路径
+        user_text: 模拟用户提问
+
+    Returns:
+        dict: 结果字典，ok=True 表示成功
+    """
     total_start = time.perf_counter()
     test_image_path = Path(test_image_path)
+    # 检查图片是否存在
     if not test_image_path.exists():
         return _failure(
             stage="image_not_found",
@@ -54,10 +95,12 @@ async def run_camera_guide_test(
             total_start=total_start,
         )
 
+    # 第 1 步：视觉分析
     vision_start = time.perf_counter()
     try:
         vision_result = await asyncio.to_thread(vision_service.analyze_for_guide_context, test_image_path)
     except VisionJsonParseError as exc:
+        # JSON 解析失败，记录调试日志
         _log_camera_guide_debug(
             {
                 "test_image_path": str(test_image_path),
@@ -94,6 +137,7 @@ async def run_camera_guide_test(
         )
     vision_elapsed_ms = _elapsed_ms(vision_start)
 
+    # 第 2 步：重写 prompt 并调用百炼应用
     rewritten_prompt = build_camera_guide_prompt(user_text, vision_result)
     bailian_start = time.perf_counter()
     try:
@@ -120,6 +164,8 @@ async def run_camera_guide_test(
             total_start=total_start,
         )
     bailian_elapsed_ms = _elapsed_ms(bailian_start)
+
+    # 检查是否为降级回复
     if bailian_answer == FALLBACK_TEXT:
         total_elapsed_ms = _elapsed_ms(total_start)
         _log_camera_guide_debug(
@@ -141,6 +187,8 @@ async def run_camera_guide_test(
             test_image_path=test_image_path,
             total_start=total_start,
         )
+
+    # 成功完成
     total_elapsed_ms = _elapsed_ms(total_start)
     _log_camera_guide_debug(
         _debug_log_payload(
@@ -181,6 +229,7 @@ def _debug_log_payload(
     bailian_error_type: str,
     total_elapsed_ms: int,
 ) -> dict[str, Any]:
+    """构建调试日志负载（截取关键字段，避免日志过长）。"""
     return {
         "test_image_path": str(test_image_path),
         "user_text": user_text,
@@ -206,6 +255,7 @@ def _failure(
     total_start: float,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """构建失败结果字典。"""
     data: dict[str, Any] = {
         "ok": False,
         "stage": stage,
@@ -220,16 +270,19 @@ def _failure(
 
 
 def _log_camera_guide_debug(payload: dict[str, Any]) -> None:
+    """输出相机导游调试日志（JSON 格式）。"""
     text = json.dumps(payload, ensure_ascii=False)
     logger.info("[CAMERA-GUIDE-DEBUG] %s", text)
     print(f"[CAMERA-GUIDE-DEBUG] {text}", flush=True)
 
 
 def _elapsed_ms(start: float) -> int:
+    """计算从 start 到现在的毫秒数。"""
     return int((time.perf_counter() - start) * 1000)
 
 
 def _preview_text(text: str, limit: int) -> str:
+    """截取文本预览，特殊字符转义。"""
     normalized = (text or "").replace("\r", "\\r").replace("\n", "\\n")
     if len(normalized) <= limit:
         return normalized
@@ -237,6 +290,7 @@ def _preview_text(text: str, limit: int) -> str:
 
 
 def _str_list(value: Any) -> list[str]:
+    """将输入值转为非空字符串列表。"""
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     if isinstance(value, str) and value.strip():
