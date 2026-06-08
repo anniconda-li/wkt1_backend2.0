@@ -16,11 +16,11 @@ ESP32S3 AI 对讲导游设备的本地 FastAPI 后端。
 
 ```text
 core/       项目基础配置：加载 .env、统一路径常量、创建运行目录
-server/     FastAPI/UDP 服务入口和设备协议处理
+server/     生产服务入口：FastAPI app、UDP 服务循环、协议和媒体解析
 services/   正式业务能力：ASR、TTS、百炼、视觉、语音问答、拍照问答
 knowledge/  文物知识库资料：参考图、候选配置、每件文物 Markdown
 tests/      测试脚本和测试数据
-tools/      正式工具脚本：清理 tmp、构建知识库、检查参考图
+tools/      维护和调试工具：清理 tmp、构建知识库、检查参考图、端到端调试
 tmp/        运行时临时产物，可清理
 ```
 
@@ -53,6 +53,7 @@ BAILIAN_APP_ID=your_bailian_app_id
 BAILIAN_APP_BASE_URL=https://dashscope.aliyuncs.com
 BAILIAN_TIMEOUT=15
 AUTO_TTS_BACKGROUND=true
+ENABLE_DEBUG_ROUTES=false
 ```
 
 项目入口会通过 `core/config.py` 自动加载根目录 `.env`。
@@ -72,8 +73,29 @@ pip install -r requirements.txt
 
 ## 启动服务
 
+HTTP 服务可以直接交给 uvicorn 管理，适合部署到服务器、进程管理器或反向代理后面：
+
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+这个命令只启动 HTTP API：
+
+```text
+HTTP: http://<PC_LAN_IP>:8000
+```
+
+健康检查：
+
+```text
+GET /healthz
+GET /readyz
+```
+
+如果设备还需要 UDP 实时对讲服务，使用完整设备入口：
+
+```powershell
+.\.venv\Scripts\python.exe -m server.walkie_app --host 0.0.0.0 --http-port 8000 --udp-port 9000
 ```
 
 服务启动后：
@@ -83,7 +105,15 @@ HTTP: http://<PC_LAN_IP>:8000
 UDP:  9000
 ```
 
-ESP32S3 固件中的 HTTP 地址应指向这台电脑的局域网 IP。
+ESP32S3 固件中的 HTTP/UDP 地址应指向这台服务器的局域网 IP。
+
+生产环境默认不暴露调试接口。确实需要临时调试时再设置：
+
+```text
+ENABLE_DEBUG_ROUTES=true
+```
+
+开启后才会注册 `/debug/camera_guide/test`。
 
 ## 实时对讲
 

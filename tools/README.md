@@ -1,6 +1,6 @@
 # tools 目录说明
 
-tools 只放正式工具脚本，不放测试脚本。
+tools 放维护和调试工具脚本，不承载生产 HTTP/UDP 入口。
 
 ```powershell
 python tools\build_exhibit_knowledge.py --export-only
@@ -14,8 +14,8 @@ python tools\check_museum_refs.py
 python tools\clean_tmp.py
 ```
 
-测试和调试脚本统一放在：
+相机导游端到端调试逻辑在 `tools/camera_guide_debug.py`，命令行入口仍放在：
 
 ```text
-tests/scripts/
+tests/scripts/camera_guide.py
 ```

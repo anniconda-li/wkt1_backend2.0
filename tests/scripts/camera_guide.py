@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import core.config  # noqa: E402,F401 - 加载项目 .env 环境变量
 from core.paths import DEFAULT_CAMERA_TEST_IMAGE, ensure_project_dirs
 from services.bailian_app_service import BailianAppService
-from server.camera_guide_debug import DEFAULT_CAMERA_GUIDE_TEST_TEXT, run_camera_guide_test
+from tools.camera_guide_debug import DEFAULT_CAMERA_GUIDE_TEST_TEXT, run_camera_guide_test
 from services.vision_service import VisionService
 
 

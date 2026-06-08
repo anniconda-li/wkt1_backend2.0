@@ -31,7 +31,6 @@ import asyncio
 import json
 import logging
 import os
-import socket
 import threading
 import time
 from datetime import datetime
@@ -51,13 +50,12 @@ from core.paths import (
     env_path,
 )
 from services.bailian_app_service import BailianAppService
-from server.camera_guide_debug import run_camera_guide_test
 from server.media import (
     parse_wav,
     validate_and_log_jpeg,
     validate_and_log_wav,
 )
-from server.protocol import PKT_TYPES, make_server_echo, parse_packet
+from server.udp_server import run_udp
 from services.ai_session_store import (
     AiSession,
     AiSessionStore,
@@ -112,63 +110,6 @@ def auto_tts_background_enabled() -> bool:
 
 
 # =============================================================================
-# UDP 服务器
-# =============================================================================
-
-def run_udp(host: str, port: int) -> None:
-    """运行 UDP WTK1 协议服务器。
-
-    功能：
-    - 接收并记录所有 WTK1 协议包
-    - 转发音频包给同一频道的其他设备
-    - 单设备场景下回传服务端回显包
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.bind((host, port))
-    except OSError as exc:
-        log(f"UDP 绑定失败 {host}:{port}: {exc}")
-        return
-    log(f"UDP WTK1 监听 {host}:{port}")
-
-    # 设备注册表: device -> (ip, port, channel)
-    devices: dict[str, tuple[str, int, int]] = {}
-
-    while True:
-        data, addr = sock.recvfrom(2048)
-        packet = parse_packet(data)
-        if packet is None:
-            log(f"UDP 原始数据 from {addr[0]}:{addr[1]} len={len(data)} data={data!r}")
-            continue
-
-        type_name = PKT_TYPES.get(packet.packet_type, f"type_{packet.packet_type}")
-        devices[packet.device] = (addr[0], addr[1], packet.channel)
-        log(
-            f"UDP {type_name} from {packet.device}@{addr[0]}:{addr[1]} "
-            f"ch={packet.channel} seq={packet.seq} payload={len(packet.payload)}"
-        )
-
-        # 音频包转发逻辑
-        if packet.packet_type == 4 and packet.payload:
-            # 查找同一频道的其他设备
-            targets = [
-                (dev, dev_addr)
-                for dev, (ip, port, channel) in devices.items()
-                if dev != packet.device and channel == packet.channel
-                for dev_addr in [(ip, port)]
-            ]
-            if targets:
-                # 多设备：转发给同一频道的其他设备
-                for dev, dev_addr in targets:
-                    sock.sendto(data, dev_addr)
-                    log(f"UDP 音频转发至 {dev}@{dev_addr[0]}:{dev_addr[1]}")
-            else:
-                # 单设备测试：回传服务端回显包
-                # 需要将 device 字段改为非本地设备名，否则客户端会丢弃
-                sock.sendto(make_server_echo(data), addr)
-
-
-# =============================================================================
 # FastAPI HTTP 应用
 # =============================================================================
 
@@ -220,6 +161,21 @@ def create_http_app(
     app.state.voice_qa_service = VoiceQaService(bailian_app_service)
     app.state.vision_service = VisionService()
     app.state.photo_guide_service = PhotoGuideService(bailian_app_service)
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, object]:
+        """Liveness probe: process is up and the app can answer requests."""
+        return {"ok": True, "service": "wkt1-backend"}
+
+    @app.get("/readyz")
+    async def readyz() -> dict[str, object]:
+        """Readiness probe with lightweight dependency configuration checks."""
+        return {
+            "ok": True,
+            "bailian_configured": bool(app.state.bailian_app_service.api_key and app.state.bailian_app_service.app_id),
+            "vision_provider": app.state.vision_service.provider,
+            "sessions": len(app.state.ai_sessions),
+        }
 
     # =========================================================================
     # 会话管理辅助函数
@@ -476,18 +432,18 @@ def create_http_app(
     # 调试接口：相机导游端到端测试
     # =========================================================================
 
-    @app.get("/debug/camera_guide/test")
-    async def debug_camera_guide_test() -> JSONResponse:
-        """端到端相机导游调试接口。
+    if os.getenv("ENABLE_DEBUG_ROUTES", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        @app.get("/debug/camera_guide/test")
+        async def debug_camera_guide_test() -> JSONResponse:
+            """端到端相机导游调试接口，生产环境默认关闭。"""
+            from tools.camera_guide_debug import run_camera_guide_test
 
-        使用默认测试图片运行完整的视觉分析 → 知识库检索链路。
-        """
-        result = await run_camera_guide_test(
-            vision_service=app.state.vision_service,
-            bailian_app_service=app.state.bailian_app_service,
-            test_image_path=DEFAULT_CAMERA_TEST_IMAGE,
-        )
-        return JSONResponse(result, status_code=200 if result.get("ok") else 500)
+            result = await run_camera_guide_test(
+                vision_service=app.state.vision_service,
+                bailian_app_service=app.state.bailian_app_service,
+                test_image_path=DEFAULT_CAMERA_TEST_IMAGE,
+            )
+            return JSONResponse(result, status_code=200 if result.get("ok") else 500)
 
     # =========================================================================
     # 相机视觉分析
@@ -1093,7 +1049,7 @@ def run_http(
         ai_reply_extra_chunk: 是否添加额外数据块
     """
     app = create_http_app(wav_save_dir, jpg_save_dir, ai_reply_repeat, ai_reply_extra_chunk)
-    log(f"FastAPI AI WAV + 相机 JPEG 测试服务监听 {host}:{port}")
+    log(f"FastAPI AI WAV + 相机 JPEG 服务监听 {host}:{port}")
     log(f"AI 基础 URL: http://<PC_LAN_IP>:{port}")
     log(f"AI reply repeat={max(ai_reply_repeat, 1)} extra_chunk={int(ai_reply_extra_chunk)}")
     log(f"相机上传 URL: http://<PC_LAN_IP>:{port}/camera/upload")
@@ -1110,10 +1066,10 @@ def main() -> None:
     UDP 和 HTTP 分别在独立守护线程中运行。
     主线程等待 Ctrl+C 信号后退出。
     """
-    parser = argparse.ArgumentParser(description="Walkie 业务测试服务器")
+    parser = argparse.ArgumentParser(description="WTK1 设备业务服务器")
     parser.add_argument("--host", default=DEFAULT_BIND_HOST, help="绑定地址")
     parser.add_argument("--udp-port", type=int, default=DEFAULT_UDP_PORT, help="WTK1 UDP 监听端口")
-    parser.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT, help="AI WAV HTTP 端口")
+    parser.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT, help="HTTP API 监听端口")
     parser.add_argument("--wav-save-dir", default=str(DEFAULT_WAV_SAVE_DIR), help="接收到的 WAV 文件保存目录")
     parser.add_argument("--jpg-save-dir", default=str(DEFAULT_JPG_SAVE_DIR), help="接收到的 JPEG 文件保存目录")
     parser.add_argument(
@@ -1131,7 +1087,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # 启动 UDP 服务器（守护线程）
-    threading.Thread(target=run_udp, args=(args.host, args.udp_port), daemon=True).start()
+    threading.Thread(target=run_udp, args=(args.host, args.udp_port), kwargs={"log_func": log}, daemon=True).start()
     # 启动 HTTP 服务器（守护线程）
     threading.Thread(
         target=run_http,
