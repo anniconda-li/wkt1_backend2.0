@@ -433,6 +433,10 @@ def _term_matches(query_text: str, term: str) -> bool:
     normalized = _normalize_text(term)
     if not normalized:
         return False
+    # 单字特征词容易误伤普通描述，例如“流”会命中“线条流畅”。
+    # 候选库里应使用“长流”“器身有流”“青铜簋”等更稳定的词组。
+    if len(normalized) < 2:
+        return False
     if normalized in query_text:
         return True
     parts = [
